@@ -3,7 +3,7 @@ import re
 import json
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,132 +14,97 @@ from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+ORDERS_PATH = "data/orders.json"
+FAQ_PATH = "data/faq.json"
+
+with open(ORDERS_PATH, "r", encoding="utf-8") as f:
+    orders: Dict[str, Any] = json.load(f)
+
+with open(FAQ_PATH, "r", encoding="utf-8") as f:
+    faq_items: List[Dict[str, Any]] = json.load(f)
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
-
 def now_ts() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-
-def load_json_file(path: str, default: Any) -> Any:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return default
-    except json.JSONDecodeError:
-        return default
-
-
-def tokenize_simple(text: str) -> List[str]:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return [t for t in text.split() if len(t) > 2]
-
-
-def best_faq_match(question: str, faq_items: List[Dict[str, Any]], min_score: int = 2) -> Optional[Dict[str, Any]]:
-    """
-    Very simple keyword-overlap retrieval:
-      - each FAQ item is expected to have: {"q": "...", "a": "...", "keywords": [...] (optional)}
-    """
-    q_tokens = set(tokenize_simple(question))
-    if not q_tokens:
-        return None
-
-    best = None
-    best_score = 0
-
-    for item in faq_items:
-        keywords = item.get("keywords")
-        if isinstance(keywords, list) and keywords:
-            item_tokens = set(tokenize_simple(" ".join(map(str, keywords))))
-        else:
-            item_tokens = set(tokenize_simple(str(item.get("q", ""))))
-
-        score = len(q_tokens & item_tokens)
-        if score > best_score:
-            best_score = score
-            best = item
-
-    if best_score >= min_score:
-        return best
-    return None
-
-
-def find_order(order_id: str, orders_obj: Any) -> Optional[Dict[str, Any]]:
-    """
-    Supports a few common shapes:
-      - {"orders":[{"id":"123","status":"..."}]}
-      - [{"id":"123","status":"..."}]
-      - {"123":{"status":"..."}}  (dict keyed by id)
-    """
-    if orders_obj is None:
-        return None
-
-    if isinstance(orders_obj, dict):
-        if order_id in orders_obj and isinstance(orders_obj[order_id], dict):
-            d = dict(orders_obj[order_id])
-            d.setdefault("id", order_id)
-            return d
-
-        if "orders" in orders_obj and isinstance(orders_obj["orders"], list):
-            for o in orders_obj["orders"]:
-                if str(o.get("id")) == order_id:
-                    return o
-        return None
-
-    if isinstance(orders_obj, list):
-        for o in orders_obj:
-            if isinstance(o, dict) and str(o.get("id")) == order_id:
-                return o
-
-    return None
-
 
 def jsonl_write(fp: str, record: Dict[str, Any]) -> None:
     with open(fp, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+def tokenize_unicode(text: str) -> List[str]:
+    text = normalize_text(text)
+    tokens = re.split(r"[^\w]+", text, flags=re.UNICODE)
+    return [t for t in tokens if len(t) > 2]
+
+def find_order(order_id: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(orders, dict):
+        return None
+    return orders.get(str(order_id))
+
+def find_faq_answer(question: str) -> Optional[str]:
+    if not isinstance(faq_items, list) or not question.strip():
+        return None
+
+    q_norm = normalize_text(question)
+    q_tokens = set(tokenize_unicode(question))
+
+    best_answer: Optional[str] = None
+    best_score = 0
+
+    for item in faq_items:
+        if not isinstance(item, dict):
+            continue
+
+        q_field = str(item.get("q", "") or "")
+        a_field = str(item.get("a", "") or "")
+        if not q_field or not a_field:
+            continue
+
+        keywords = item.get("keywords")
+        if isinstance(keywords, list) and keywords:
+            item_text = " ".join(map(str, keywords))
+        else:
+            item_text = q_field
+
+        item_tokens = set(tokenize_unicode(item_text))
+        score = len(q_tokens & item_tokens)
+
+        item_q_norm = normalize_text(q_field)
+        if item_q_norm and (item_q_norm in q_norm or q_norm in item_q_norm):
+            score += 2
+
+        if score > best_score:
+            best_score = score
+            best_answer = a_field
+
+    return best_answer if best_score >= 2 else None
 
 # -----------------------------
 # CLI Bot
 # -----------------------------
-
 class ShoplyCLIBot:
-    def __init__(
-        self,
-        model_name: str,
-        faq_path: str = "faq.json",
-        orders_path: str = "orders.json",
-        logs_dir: str = "logs",
-    ):
+    def __init__(self, model_name: str, logs_dir: str = "logs"):
         ensure_dir(logs_dir)
         self.logs_dir = logs_dir
-        self.faq_path = faq_path
-        self.orders_path = orders_path
-
-        self.faq_items: List[Dict[str, Any]] = load_json_file(self.faq_path, default=[])
-        self.orders_obj: Any = load_json_file(self.orders_path, default=None)
 
         self.store: Dict[str, InMemoryChatMessageHistory] = {}
 
         self.system_prompt = (
             "You are Shoply Support, a concise and polite ecommerce support assistant.\n"
             "Rules:\n"
-            "1) Use ONLY the provided FAQ answer when an FAQ match is available.\n"
-            "2) For order questions, you MUST rely only on the explicit order status provided.\n"
-            "3) If the user asks something not covered by FAQ or the order status, say you don't have that info and "
-            "ask a brief follow-up or suggest contacting support.\n"
+            "1) If an FAQ answer is available, respond using ONLY that FAQ answer.\n"
+            "2) For /order lookups, rely ONLY on the order data provided.\n"
+            "3) If info is not in FAQ or order data, say you don’t have that info and suggest contacting support.\n"
             "4) Keep responses short, factual, and helpful. No guessing.\n"
         )
 
         self.chat_model = ChatOpenAI(
-            model=model_name, 
+            model=model_name,
             temperature=0,
             request_timeout=15,
         )
@@ -159,10 +124,7 @@ class ShoplyCLIBot:
             history_messages_key="history",
         )
 
-        # Token usage counters for the current session (accumulated)
         self.session_usage: Dict[str, Dict[str, int]] = {}
-
-        # Created per session
         self.session_logfile: Dict[str, str] = {}
 
     def get_session_history(self, session_id: str) -> InMemoryChatMessageHistory:
@@ -175,17 +137,11 @@ class ShoplyCLIBot:
             del self.store[session_id]
         self.session_usage.pop(session_id, None)
 
-    def reload_data(self) -> None:
-        # optional: call if you want hot-reload
-        self.faq_items = load_json_file(self.faq_path, default=[])
-        self.orders_obj = load_json_file(self.orders_path, default=None)
-
     def _ensure_session_logging(self, session_id: str) -> str:
         if session_id in self.session_logfile:
             return self.session_logfile[session_id]
         fp = os.path.join(self.logs_dir, f"session_{session_id}_{now_ts()}.jsonl")
         self.session_logfile[session_id] = fp
-        # write session start record
         jsonl_write(fp, {
             "type": "session_start",
             "session_id": session_id,
@@ -194,7 +150,6 @@ class ShoplyCLIBot:
         return fp
 
     def _accumulate_usage(self, session_id: str, usage: Dict[str, Any]) -> None:
-        # usage from OpenAI models often: {"prompt_tokens":..., "completion_tokens":..., "total_tokens":...}
         pt = int(usage.get("prompt_tokens") or 0)
         ct = int(usage.get("completion_tokens") or 0)
         tt = int(usage.get("total_tokens") or (pt + ct))
@@ -208,7 +163,7 @@ class ShoplyCLIBot:
 
     def _log_turn(self, session_id: str, user_text: str, bot_text: str, usage: Dict[str, Any], meta: Dict[str, Any]) -> None:
         fp = self._ensure_session_logging(session_id)
-        record = {
+        jsonl_write(fp, {
             "type": "turn",
             "session_id": session_id,
             "ts": datetime.utcnow().isoformat() + "Z",
@@ -221,8 +176,7 @@ class ShoplyCLIBot:
             },
             "meta": meta,
             "session_usage_total": self.session_usage.get(session_id, {}),
-        }
-        jsonl_write(fp, record)
+        })
 
     def _log_event(self, session_id: str, event_type: str, payload: Dict[str, Any]) -> None:
         fp = self._ensure_session_logging(session_id)
@@ -233,25 +187,29 @@ class ShoplyCLIBot:
             **payload
         })
 
+    def _format_order_reply(self, order_id: str, order: Dict[str, Any]) -> str:
+        status = str(order.get("status", "unknown"))
+        extras = []
+        for k in ("eta_days", "delivered_at", "carrier", "tracking", "note"):
+            if k in order and order[k] is not None and str(order[k]).strip() != "":
+                extras.append(f"{k}: {order[k]}")
+        extra_text = f" ({', '.join(extras)})" if extras else ""
+        return f"Order {order_id} status: {status}{extra_text}."
+
     def handle_order_command(self, session_id: str, user_text: str) -> str:
-        # /order 12345
         m = re.match(r"^\s*/order\s+([A-Za-z0-9_-]+)\s*$", user_text)
         if not m:
-            return "Usage: /order <id>"
+            reply = "Usage: /order <id>"
+            self._log_turn(session_id, user_text, reply, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, {"route": "order_command"})
+            return reply
 
         order_id = m.group(1)
-        order = find_order(order_id, self.orders_obj)
+        order = find_order(order_id)
 
         if not order:
             reply = f"Sorry — I couldn’t find order {order_id}. Please double-check the ID."
         else:
-            status = order.get("status", "unknown")
-            extras = []
-            for k in ("eta", "tracking", "carrier"):
-                if k in order and order[k]:
-                    extras.append(f"{k}: {order[k]}")
-            extra_text = f" ({', '.join(extras)})" if extras else ""
-            reply = f"Order {order_id} status: {status}{extra_text}."
+            reply = self._format_order_reply(order_id, order)
 
         self._ensure_session_logging(session_id)
         self._log_event(session_id, "order_lookup", {"order_id": order_id, "found": bool(order)})
@@ -265,16 +223,15 @@ class ShoplyCLIBot:
         return reply
 
     def handle_faq_or_llm(self, session_id: str, user_text: str) -> str:
-        faq_match = best_faq_match(user_text, self.faq_items, min_score=2)
-        if faq_match:
-            reply = str(faq_match.get("a", "")).strip() or "Sorry — I don't have that answer in the FAQ."
-            self._ensure_session_logging(session_id)
+        answer = find_faq_answer(user_text)
+        if answer:
+            reply = answer.strip()
             self._log_turn(
                 session_id=session_id,
                 user_text=user_text,
                 bot_text=reply,
                 usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                meta={"route": "faq", "faq_q": faq_match.get("q")}
+                meta={"route": "faq"}
             )
             return reply
 
@@ -289,9 +246,7 @@ class ShoplyCLIBot:
 
         bot_text = (result.content or "").strip()
 
-        usage = {}
-        meta = {"route": "llm"}
-
+        usage: Dict[str, Any] = {}
         md = getattr(result, "response_metadata", None) or {}
         if isinstance(md, dict):
             if isinstance(md.get("token_usage"), dict):
@@ -302,8 +257,7 @@ class ShoplyCLIBot:
                 usage = md["tokenUsage"]
 
         self._accumulate_usage(session_id, usage)
-        self._log_turn(session_id, user_text, bot_text, usage, meta)
-
+        self._log_turn(session_id, user_text, bot_text, usage, {"route": "llm"})
         return bot_text
 
     def run(self, session_id: str) -> None:

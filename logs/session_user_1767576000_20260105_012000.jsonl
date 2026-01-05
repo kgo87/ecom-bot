@@ -1,0 +1,5 @@
+{"type": "session_start", "session_id": "user_1767576000", "ts": "2026-01-05T01:20:00.565380Z"}
+{"type": "order_lookup", "session_id": "user_1767576000", "ts": "2026-01-05T01:20:10.403290Z", "order_id": "98765", "found": true}
+{"type": "turn", "session_id": "user_1767576000", "ts": "2026-01-05T01:20:10.403879Z", "user": "/order 98765", "assistant": "Order 98765 status: delivered (delivered_at: 2025-08-10).", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, "meta": {"route": "order_command"}, "session_usage_total": {}}
+{"type": "turn", "session_id": "user_1767576000", "ts": "2026-01-05T01:20:20.002078Z", "user": "I have not received it", "assistant": "I don’t have that info. Please contact support for assistance.", "usage": {"prompt_tokens": 102, "completion_tokens": 13, "total_tokens": 115}, "meta": {"route": "llm"}, "session_usage_total": {"prompt_tokens": 102, "completion_tokens": 13, "total_tokens": 115}}
+{"type": "session_end", "session_id": "user_1767576000", "ts": "2026-01-05T01:20:35.549164Z", "reason": "user_exit"}
